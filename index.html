@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MAX30102 Realtime Vitals Monitor — AI Enhanced</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root{
+      --card-bg: #ffffff;
+      --muted: #6b7280;
+      --accent: #0ea5a4;
+    }
+    body{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: linear-gradient(180deg,#f8fafc 0%, #eef2f7 100%); }
+    .data-value{ font-size:1.6rem; font-weight:800; letter-spacing:-0.01em }
+    
+    /* gauge styles */
+    .gauge{
+      width:110px; height:110px; border-radius:9999px; display:grid; place-items:center; background: conic-gradient(#34d399 0%, #e6e6e6 0%); position:relative;
+      box-shadow: 0 6px 18px rgba(15,23,42,0.06);
+    }
+    .gauge .inner{ width:76px; height:76px; background:var(--card-bg); border-radius:9999px; display:grid; place-items:center; }
+    .small-muted{ color:var(--muted); font-size:0.85rem }
+
+    /* heartbeat animation */
+    .pulse {
+      width:14px; height:14px; border-radius:9999px; background:#ef4444; box-shadow:0 0 0 rgba(239,68,68,0.7); animation:pulse 1s infinite ease-in-out;
+    }
+    @keyframes pulse{ 0%{ transform:scale(1); box-shadow:0 0 0 0 rgba(239,68,68,0.6);} 70%{ transform:scale(1.25); box-shadow:0 0 0 14px rgba(239,68,68,0);} 100%{ transform:scale(1); box-shadow:0 0 0 0 rgba(239,68,68,0);} }
+
+    /* status badges */
+    .badge-good{ background:#ecfdf5; color:#065f46; padding:6px 10px; border-radius:9999px; font-weight:700; font-size:0.85rem }
+    .badge-warn{ background:#fffbeb; color:#92400e; padding:6px 10px; border-radius:9999px; font-weight:700; font-size:0.85rem }
+    .badge-bad{ background:#fff1f2; color:#7f1d1d; padding:6px 10px; border-radius:9999px; font-weight:700; font-size:0.85rem }
+    .badge-ai{ background:#f0f9ff; color:#0284c7; padding:4px 8px; border-radius:6px; font-size:0.75rem; font-weight:600; border:1px solid #bae6fd; }
+
+    /* responsive grid tweaks */
+    @media (min-width: 768px){ .grid-main { grid-template-columns: 1fr 420px; } }
+
+    .card { background:var(--card-bg); border-radius:16px; padding:1.25rem; box-shadow: 0 8px 30px rgba(2,6,23,0.06); }
+    .muted { color:var(--muted) }
+
+    /* AI Loading Animation */
+    .typing-dot {
+      animation: typing 1.4s infinite ease-in-out both;
+      height: 6px; width: 6px; background-color: #0ea5a4; border-radius: 50%; display: inline-block; margin: 0 2px;
+    }
+    .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+    .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+    @keyframes typing { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+    
+    /* Checkbox styles */
+    .task-item input:checked + span { text-decoration: line-through; color: #9ca3af; }
+
+  </style>
+</head>
+<body class="p-6 sm:p-12">
+  <div class="max-w-6xl mx-auto">
+    <header class="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div>
+        <h1 class="text-3xl font-extrabold text-slate-900">MAX30102 Vitals Monitor</h1>
+        <p class="text-slate-600 mt-1">Realtime IoT Stream + AI Analysis</p>
+      </div>
+      <div class="flex gap-2">
+         <span class="badge-ai">Powered by Gemini</span>
+      </div>
+    </header>
+
+    <main class="grid gap-6 grid-main">
+
+      <section>
+        <div class="card mb-6">
+          <div class="flex items-start justify-between">
+            <div>
+              <h2 class="text-lg font-semibold text-slate-800">Current Vitals</h2>
+              <p class="text-sm muted mt-1">Live from sensor</p>
+            </div>
+            <div class="text-right">
+              <div class="small-muted">Last update</div>
+              <div id="latest-time" class="font-semibold text-slate-800">N/A</div>
+              <div id="latest-ts-ms" class="text-xs muted">ts: N/A</div>
+            </div>
+          </div>
+
+          <div class="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div class="p-4 rounded-lg bg-gradient-to-b from-white to-slate-50 border border-slate-100">
+              <div class="flex items-center gap-3 justify-between">
+                <div>
+                  <div class="text-sm muted">Heart Rate</div>
+                  <div class="data-value text-slate-900 mt-1" id="latest-bpm">N/A</div>
+                  <div class="small-muted">BPM</div>
+                </div>
+                <div class="flex flex-col items-center">
+                  <div class="pulse" id="bpm-pulse" style="display:none"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="p-4 rounded-lg bg-gradient-to-b from-white to-slate-50 border border-slate-100 flex items-center justify-between">
+              <div>
+                <div class="text-sm muted">Oxygen Saturation</div>
+                <div class="flex items-center gap-3 mt-2">
+                  <div class="gauge" id="spo2-gauge" style="--value:95">
+                    <div class="inner">
+                      <div class="text-center">
+                        <div id="latest-spo2" class="font-bold">95%</div>
+                        <div class="text-xs muted">SpO₂</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="p-4 rounded-lg bg-gradient-to-b from-white to-slate-50 border border-slate-100">
+              <div class="text-sm muted">Fatigue Index</div>
+              <div class="flex items-center justify-between mt-2">
+                <div>
+                  <div id="latest-fatigue" class="data-value text-slate-900">N/A</div>
+                  <div class="small-muted">Percent</div>
+                </div>
+                <div class="w-full max-w-[80px]">
+                  <div class="h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div id="fatigue-bar" class="h-3 rounded-full" style="width:0% ; background: linear-gradient(90deg,#f97316,#fb7185);"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <div class="mt-4 flex items-center justify-between gap-4">
+            <div class="flex items-center gap-4">
+               <div class="small-muted">Status: <span id="hypoxia-badge" class="badge-good ml-1">N/A</span></div>
+               <div class="small-muted">Sensor: <span id="finger-badge" class="badge-warn ml-1">Unknown</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-6 border-l-4 border-[#0ea5a4]">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-slate-800 flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-yellow-500"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>
+                    AI Health Insight
+                </h3>
+                <button id="ask-ai-btn" class="bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium py-2 px-4 rounded-lg transition-colors shadow-lg shadow-slate-200">
+                    Analyze My Vitals
+                </button>
+            </div>
+            
+            <div id="ai-result-container" class="hidden bg-slate-50 p-4 rounded-lg text-slate-700 text-sm leading-relaxed border border-slate-100">
+                <p id="ai-text-content"></p>
+            </div>
+            
+            <div id="ai-loading" class="hidden text-center py-4">
+                <div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>
+                <p class="text-xs text-slate-400 mt-2">Generating insights based on BPM & SpO2...</p>
+            </div>
+        </div>
+
+        <div class="card">
+          <h3 class="text-md font-semibold text-slate-800 mb-3">Sensor Data Log</h3>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm text-slate-700">
+            <div class="p-2 bg-slate-50 rounded">
+              <span class="small-muted block">IR Raw</span>
+              <span id="data-ir-raw" class="font-mono font-bold">N/A</span>
+            </div>
+            <div class="p-2 bg-slate-50 rounded">
+              <span class="small-muted block">RED Raw</span>
+              <span id="data-red-raw" class="font-mono font-bold">N/A</span>
+            </div>
+            <div class="p-2 bg-slate-50 rounded">
+              <span class="small-muted block">Filtered IR</span>
+              <span id="data-ir-ac" class="font-mono font-bold">N/A</span>
+            </div>
+            <div class="p-2 bg-slate-50 rounded">
+              <span class="small-muted block">Timestamp</span>
+              <span id="data-ts-ms" class="font-mono text-xs">N/A</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside>
+        
+        <div class="card mb-6">
+            <h3 class="font-semibold text-slate-800 mb-3">Daily Health Goals</h3>
+            <div class="space-y-3">
+                <label class="task-item flex items-center space-x-3 cursor-pointer p-2 hover:bg-slate-50 rounded transition">
+                    <input type="checkbox" class="form-checkbox h-5 w-5 text-teal-600 rounded border-gray-300 focus:ring-teal-500">
+                    <span class="text-slate-700 text-sm font-medium">Drink 2L Water</span>
+                </label>
+                <label class="task-item flex items-center space-x-3 cursor-pointer p-2 hover:bg-slate-50 rounded transition">
+                    <input type="checkbox" class="form-checkbox h-5 w-5 text-teal-600 rounded border-gray-300 focus:ring-teal-500">
+                    <span class="text-slate-700 text-sm font-medium">10k Steps Walk</span>
+                </label>
+                <label class="task-item flex items-center space-x-3 cursor-pointer p-2 hover:bg-slate-50 rounded transition">
+                    <input type="checkbox" class="form-checkbox h-5 w-5 text-teal-600 rounded border-gray-300 focus:ring-teal-500">
+                    <span class="text-slate-700 text-sm font-medium">Deep Breathing (5 min)</span>
+                </label>
+                <label class="task-item flex items-center space-x-3 cursor-pointer p-2 hover:bg-slate-50 rounded transition">
+                    <input type="checkbox" class="form-checkbox h-5 w-5 text-teal-600 rounded border-gray-300 focus:ring-teal-500">
+                    <span class="text-slate-700 text-sm font-medium">No Screen Time (1 hr)</span>
+                </label>
+            </div>
+        </div>
+
+        <div class="card mb-6">
+          <h3 class="font-semibold text-slate-800">Telemetry</h3>
+          <p class="small-muted mt-1">Quick glance values</p>
+          <div class="mt-4 grid gap-3">
+            <div class="flex items-center justify-between">
+              <div class="small-muted">BPM</div>
+              <div id="tele-bpm" class="font-semibold">N/A</div>
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="small-muted">SpO₂</div>
+              <div id="tele-spo2" class="font-semibold">N/A</div>
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="small-muted">Fatigue %</div>
+              <div id="tele-fatigue" class="font-semibold">N/A</div>
+            </div>
+            <div class="border-t pt-3">
+              <button id="copy-btn" class="w-full py-2 rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 font-semibold transition text-sm">Copy JSON Data</button>
+            </div>
+          </div>
+        </div>
+
+      </aside>
+
+    </main>
+
+    <footer class="mt-8 text-sm muted text-center">Built for MAX30102 + ESP32</footer>
+  </div>
+
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+
+  <script>
+    // ==========================================
+    // 1. CONFIGURATION
+    // ==========================================
+    
+    // Your Key (Make sure Generative Language API is enabled for this key)
+    const GEMINI_API_KEY = "PUT_YOUR_GEMINI_KEY"; 
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyBbd06bsMtgHOMTzRsHmPqLwXlsFjXPvLw", // This is your Firebase Key
+      authDomain: "new-project-ad7f0.firebaseapp.com",
+      databaseURL: "https://new-project-ad7f0-default-rtdb.firebaseio.com",
+      projectId: "new-project-ad7f0"
+    };
+
+    // ==========================================
+    // 2. APP LOGIC
+    // ==========================================
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+    const CURRENT_PATH = 'vitals/current_reading';
+
+    // Global vars
+    let curBPM = 0;
+    let curSpO2 = 0;
+    let curFatigue = 0;
+
+    // UI refs
+    const latestTimeEl = document.getElementById('latest-time');
+    const latestTsMsEl = document.getElementById('latest-ts-ms');
+    const latestBpmEl = document.getElementById('latest-bpm');
+    const latestSpo2El = document.getElementById('latest-spo2');
+    const latestFatigueEl = document.getElementById('latest-fatigue');
+    const fingerBadge = document.getElementById('finger-badge');
+    const hypoxiaBadge = document.getElementById('hypoxia-badge');
+
+    const dataIRRawEl = document.getElementById('data-ir-raw');
+    const dataREDRawEl = document.getElementById('data-red-raw');
+    const dataIRACEl = document.getElementById('data-ir-ac');
+    const dataTsMsEl = document.getElementById('data-ts-ms');
+
+    const teleBpm = document.getElementById('tele-bpm');
+    const teleSpo2 = document.getElementById('tele-spo2');
+    const teleFatigue = document.getElementById('tele-fatigue');
+    const copyBtn = document.getElementById('copy-btn');
+
+    // AI Refs
+    const askAiBtn = document.getElementById('ask-ai-btn');
+    const aiResultContainer = document.getElementById('ai-result-container');
+    const aiTextContent = document.getElementById('ai-text-content');
+    const aiLoading = document.getElementById('ai-loading');
+
+    function safeVal(v){ return (v === undefined || v === null) ? 'N/A' : v }
+
+    function setGauge(el, percent){
+      percent = Math.max(0, Math.min(100, Number(percent)||0));
+      el.style.background = `conic-gradient(${percent>=95? '#34d399' : (percent>=90? '#f59e0b' : '#fb7185')} ${percent}%, #e6e6e6 0%)`;
+    }
+
+    function setBadgeText(badgeEl, status){
+      if(!status){ badgeEl.textContent = 'N/A'; badgeEl.className = 'badge-warn ml-1'; return; }
+      const s = String(status).toLowerCase();
+      if(s.includes('normal') || s.includes('ok') || Number(status)>=95){ badgeEl.textContent = status; badgeEl.className = 'badge-good ml-1'; }
+      else if(s.includes('mild') || s.includes('warn') || (Number(status) >= 90 && Number(status) < 95)){ badgeEl.textContent = status; badgeEl.className = 'badge-warn ml-1'; }
+      else { badgeEl.textContent = status; badgeEl.className = 'badge-bad ml-1'; }
+    }
+
+    // Listen for realtime updates
+    db.ref(CURRENT_PATH).on('value', snapshot => {
+      const data = snapshot.val();
+      if(!data){ latestTimeEl.textContent = 'Wait...'; return; }
+
+      const bpm = data.BPM ?? data.bpm ?? data.HeartRate ?? 0;
+      const spo2 = data.SpO2 ?? data.spo2 ?? 0;
+      const fatigue = data.Fatigue_Percent ?? data.fatigue_percent ?? 'N/A';
+      const hypoxia = data.Hypoxia_Status ?? data.hypoxia_status ?? null;
+      const irRaw = data.IR_Raw ?? data.ir_raw ?? 'N/A';
+      const redRaw = data.RED_Raw ?? data.red_raw ?? 'N/A';
+      const irAC = data.IR_AC ?? data.ir_ac ?? 'N/A';
+      const ts = data.timestamp_ms ?? data.ts ?? 'N/A';
+      const timeStr = data.time ?? data.Time ?? 'N/A';
+
+      curBPM = Number(bpm) || 0;
+      curSpO2 = Number(spo2) || 0;
+      curFatigue = fatigue === 'N/A' ? 0 : Number(fatigue);
+
+      latestTimeEl.textContent = timeStr;
+      latestTsMsEl.textContent = `ts: ${ts}`;
+      latestBpmEl.textContent = safeVal(bpm);
+      latestSpo2El.textContent = (spo2 === 'N/A') ? 'N/A' : (safeVal(spo2) + '%');
+      latestFatigueEl.textContent = (fatigue === 'N/A') ? 'N/A' : (safeVal(fatigue) + '%');
+
+      dataIRRawEl.textContent = irRaw;
+      dataREDRawEl.textContent = redRaw;
+      dataIRACEl.textContent = irAC;
+      dataTsMsEl.textContent = ts;
+
+      teleBpm.textContent = safeVal(bpm);
+      teleSpo2.textContent = (spo2 === 'N/A') ? 'N/A' : (safeVal(spo2) + '%');
+      teleFatigue.textContent = (fatigue === 'N/A') ? 'N/A' : (safeVal(fatigue) + '%');
+
+      const gauge = document.getElementById('spo2-gauge');
+      setGauge(gauge, (Number(spo2) || 0));
+      setBadgeText(hypoxiaBadge, hypoxia ?? (Number(spo2) < 90 ? 'Low' : 'Normal'));
+
+      if(Number(bpm) > 0 && Number(spo2) > 0){
+        fingerBadge.textContent = 'Detected';
+        fingerBadge.className = 'badge-good ml-1';
+        document.getElementById('bpm-pulse').style.display = 'block';
+      } else {
+        fingerBadge.textContent = 'Absent';
+        fingerBadge.className = 'badge-warn ml-1';
+        document.getElementById('bpm-pulse').style.display = 'none';
+      }
+
+      const fb = document.getElementById('fatigue-bar');
+      const fVal = (fatigue === 'N/A') ? 0 : Math.max(0, Math.min(100, Number(fatigue)||0));
+      fb.style.width = fVal + '%';
+
+    }, err => { console.error('Firebase read error', err); });
+
+    copyBtn.addEventListener('click', async () => {
+      const snap = await db.ref(CURRENT_PATH).get();
+      const val = snap.exists() ? snap.val() : {};
+      await navigator.clipboard.writeText(JSON.stringify(val, null, 2));
+      copyBtn.textContent = 'Copied!';
+      setTimeout(()=> copyBtn.textContent = 'Copy JSON Data', 1200);
+    });
+
+    // ==========================================
+    // 3. GEMINI AI INTEGRATION (FIXED)
+    // ==========================================
+    askAiBtn.addEventListener('click', async () => {
+        // UI Reset
+        aiResultContainer.classList.add('hidden');
+        aiTextContent.textContent = '';
+        aiLoading.classList.remove('hidden');
+        askAiBtn.disabled = true;
+        askAiBtn.textContent = "Analyzing...";
+
+        if(curBPM === 0 && curSpO2 === 0) {
+             aiLoading.classList.add('hidden');
+             aiResultContainer.classList.remove('hidden');
+             aiTextContent.textContent = "No sensor data detected. Please place your finger on the sensor first.";
+             askAiBtn.disabled = false;
+             askAiBtn.textContent = "Analyze My Vitals";
+             return;
+        }
+
+        const promptText = `
+            Act as a compassionate, soft-spoken, and articulate personal health companion (similar to the persona of Baymax). 
+            
+            My current vitals are:
+            • Heart Rate: ${curBPM} BPM
+            • SpO2: ${curSpO2}%
+            • Fatigue Level: ${curFatigue}%
+            
+            Based on these metrics, please provide a response following this exact structure:
+            
+            1. **Empathetic Opening:** Start with a gentle, calming sentence acknowledging my state. If my numbers are high (stress) or low, reassure me immediately to lower my anxiety.
+            2. **Actionable Care:** Provide exactly 3 specific, simple, and soothing suggestions I can do right now to improve my well-being. (Use bullet points).
+            3. **Warm Closing:** End with a kind, supportive well-wish.
+            
+            Tone Guidelines:
+            - Be polite, articulate, and deeply empathetic.
+            - Never be alarmist. If a reading is abnormal, suggest relaxation or consulting a professional gently, without causing panic.
+            - **Strictly do not provide a medical diagnosis.** Focus on comfort, hydration, breathing, and rest.
+        `;
+
+        try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+            
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: promptText }] }]
+                })
+            });
+
+            // CHECK FOR API ERRORS HERE
+            if (!response.ok) {
+                const errorData = await response.json();
+                console.error("Gemini API Error:", errorData);
+                // Throw the REAL error message to the catch block
+                throw new Error(errorData.error?.message || response.statusText);
+            }
+
+            const data = await response.json();
+            const aiResponse = data.candidates[0].content.parts[0].text;
+            
+            // Format markdown to HTML (using <br> for newlines)
+            const cleanText = aiResponse
+              .replace(/\*\*/g, '')
+              .replace(/\*/g, '•')
+              .replace(/\n/g, '<br>');
+
+            aiTextContent.innerHTML = cleanText;
+            aiResultContainer.classList.remove('hidden');
+
+        } catch (error) {
+            console.error("Full Error:", error);
+            aiResultContainer.classList.remove('hidden');
+            // DISPLAY THE REAL ERROR
+            aiTextContent.innerHTML = `<span style="color:#ef4444; font-weight:bold;">API Error:</span> ${error.message}<br><br><span style="font-size:0.8em; color:#666">Make sure 'Generative Language API' is enabled in Google Cloud Console.</span>`;
+        } finally {
+            aiLoading.classList.add('hidden');
+            askAiBtn.disabled = false;
+            askAiBtn.textContent = "Analyze My Vitals";
+        }
+    });
+
+  </script>
+</body>
+</html>
