@@ -1,0 +1,472 @@
+/*
+    MAX30102 Vitals Monitor - AI PERCEPTRON EDITION
+    --------------------------------------------------
+    - PERCEPTRON: Auto-adjusts LED brightness based on sensor temp (Cold = Bright, Hot = Dim).
+    - SATURATION FIX: Monitors for 262143 (max) and warns user.
+    - CORE LOGIC: Refractory Period BPM + Quadratic SpO2.
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// -----------------------
+// WIFI & FIREBASE CONFIG
+// -----------------------
+#define WIFI_SSID "PScope"
+#define WIFI_PASSWORD "PScope@604"
+#define FIREBASE_HOST "new-project-ad7f0-default-rtdb.firebaseio.com"
+const String FIREBASE_PATH = "/vitals/current_reading";
+
+// -----------------------
+// NTP CONFIG
+// -----------------------
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 5 * 3600 + 30 * 60; // GMT+5:30
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+// -----------------------
+// HARDWARE & CONTROL
+// -----------------------
+MAX30105 particleSensor;
+const int BLUE_LED_PIN = 2;
+
+// -----------------------
+// AI PERCEPTRON CONFIG (LED CONTROL)
+// -----------------------
+const float TEMP_THRESHOLD = 30.0; // Target operating temp (C)
+float currentBrightness = 50.0;    // Starting Brightness (Safe Zone)
+float sharedTempC = 0.0; // <--- Temp
+unsigned long tsLastTempCheck = 0; // Timer to prevent slowing down BPM
+const unsigned long TEMP_CHECK_INTERVAL = 2000; // Check every 2 seconds
+
+// -----------------------
+// BPM VARIABLES
+// -----------------------
+const uint8_t BPM_WINDOW = 6;
+float bpmHistory[BPM_WINDOW];
+uint8_t bpmIndex = 0;
+int lastBPM = 0;
+
+// Peak detection
+static bool wasAbove = false;
+static unsigned long lastPeakTime = 0;
+const long AC_PEAK_THRESHOLD = 100; 
+const long MIN_PEAK_INTERVAL_MS = 300; 
+
+// DC Filter
+static float dcEstimateIR = 0.0;
+static float dcEstimateRED = 0.0;
+const float DC_ALPHA = 0.96;
+
+// Global AC signals
+long instantACSignalIR = 0;
+long instantACSignalRED = 0;
+
+// -----------------------
+// SPO2 SMOOTHING VARIABLES
+// -----------------------
+float avgRatio = 0.0;
+const float RATIO_ALPHA = 0.15; 
+
+// -----------------------
+// NEURAL NETWORK VARIABLES
+// -----------------------
+const uint8_t HRV_WINDOW = 10;
+long ibiHistory[HRV_WINDOW];
+uint8_t ibiIndex = 0;
+int lastNeuralFatigue = 0;
+long lastIBI_ms = 0;
+
+// Averaging & Scaling
+long fatigueSum = 0;
+int fatigueCount = 0;
+int finalSentFatigue = 0;
+
+// --- MEDIAN CALCULATION ---
+const int MAX_SAMPLES = 50; // Buffer size (enough for 5 seconds @ ~10Hz)
+int bpmBuffer[MAX_SAMPLES];
+float spo2Buffer[MAX_SAMPLES];
+int sampleIndex = 0;
+
+// Weights
+const float W_HRV = -1.5;
+const float W_SPO2 = -0.2;
+const float W_BPM = 1.2;
+const float BIAS = 0.5;
+
+// -----------------------
+// HYPOXIA CONFIG
+// -----------------------
+#define THRESHOLD_MILD_HYPOXIA     94.0
+#define THRESHOLD_MODERATE_HYPOXIA 90.0
+#define THRESHOLD_SEVERE_HYPOXIA   85.0
+
+// -----------------------
+// TIMERS
+// -----------------------
+unsigned long tsLastReport = 0;
+unsigned long tsLastFirebaseUpdate = 0;
+const unsigned long dataSendInterval = 5000;
+
+// -----------------------
+// HELPER FUNCTIONS
+// -----------------------
+
+String getLocalTimeStr() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return "Time Not Synced";
+    char timeStr[30];
+    strftime(timeStr, 30, "%H:%M:%S", &timeinfo);
+    return String(timeStr);
+}
+
+// --- NEW: INTELLIGENT BRIGHTNESS CONTROL ---
+void adjustBrightnessPerceptron() {
+    // Only run every 2 seconds to save CPU cycles for BPM
+    if (millis() - tsLastTempCheck < TEMP_CHECK_INTERVAL) return;
+    tsLastTempCheck = millis();
+
+    float tempC = particleSensor.readTemperature();
+    sharedTempC = tempC;
+
+    // 1. Input: Deviation from normal temp (Negative = Cold)
+    float input_deviation = tempC - TEMP_THRESHOLD; 
+
+    // 2. Weights: Reaction aggression
+    // -2.0 means: For every 1 degree drop, increase brightness by 2 units.
+    float weight = -2.0; 
+    float bias = 50.0; // Baseline brightness
+
+    // 3. Perceptron Calculation (Linear Activation)
+    float newBrightness = (input_deviation * weight) + bias;
+
+    // 4. Clamping (Safety)
+    // Min 20 (don't turn off), Max 85 (don't saturate/blind sensor)
+    if (newBrightness < 20.0) newBrightness = 20.0;
+    if (newBrightness > 85.0) newBrightness = 85.0;
+
+    // 5. Apply only if significant change (> 2.0) to avoid flickering
+    if (abs(newBrightness - currentBrightness) > 2.0) {
+        currentBrightness = newBrightness;
+        particleSensor.setPulseAmplitudeRed((byte)currentBrightness);
+        particleSensor.setPulseAmplitudeIR((byte)currentBrightness);
+        
+        // Debug print to see AI in action
+        Serial.print(" [AI] Temp: "); Serial.print(tempC);
+        Serial.print("C -> Adjusting LED to: "); Serial.println(currentBrightness);
+    }
+}
+
+float calculateDynamicSpO2(long red, long ir) {
+    if (ir < 50000) {
+        avgRatio = 0; 
+        return 0.0;
+    }
+
+    float currentRatio = (float)red / max((long)1, ir);
+
+    if (avgRatio == 0) avgRatio = currentRatio;
+    avgRatio = (RATIO_ALPHA * currentRatio) + ((1.0 - RATIO_ALPHA) * avgRatio);
+
+    // Quadratic Model
+    float A = 110.0;
+    float B = 14.0;
+    float C = 8.0; 
+    
+    float spo2 = A - (B * avgRatio) - (C * avgRatio * avgRatio);
+    // 1. Add Offset FIRST
+    if (sharedTempC < 30.0) {
+        float tempDiff = 30.0 - sharedTempC;
+        spo2 += (tempDiff * 0.5); // Add 0.5% SpO2 for every degree below 30
+    }
+
+    if (spo2 > 100.0) spo2 = 100.0;
+    if (spo2 < 70.0) spo2 = 70.0;
+
+    return spo2;
+}
+
+String getHypoxiaStatus(float spo2) {
+    if (spo2 <= 0.0) return "No Finger";
+    if (spo2 < THRESHOLD_SEVERE_HYPOXIA) return "Severe Hypoxia";
+    else if (spo2 < THRESHOLD_MODERATE_HYPOXIA) return "Moderate Hypoxia";
+    else if (spo2 < THRESHOLD_MILD_HYPOXIA) return "Mild Hypoxia";
+    else return "Normal";
+}
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+int calculateNeuralFatigue(long newIBI, float currentSpO2, int currentBPM) {
+    if (newIBI > 0) {
+        ibiHistory[ibiIndex++] = newIBI;
+        if (ibiIndex >= HRV_WINDOW) ibiIndex = 0;
+    }
+    
+    if (HRV_WINDOW < 2) return lastNeuralFatigue;
+
+    float sum = 0.0;
+    for (int i = 0; i < HRV_WINDOW; i++) if(ibiHistory[i] > 0) sum += ibiHistory[i];
+    float meanIBI = sum / HRV_WINDOW;
+    
+    float varianceSum = 0.0;
+    for (int i = 0; i < HRV_WINDOW; i++) {
+        if(ibiHistory[i] > 0) varianceSum += pow(ibiHistory[i] - meanIBI, 2);
+    }
+    float sdnn = sqrt(varianceSum / (HRV_WINDOW - 1));
+
+    float norm_hrv = constrain(sdnn / 50.0, 0.0, 2.0);
+    float norm_spo2 = constrain(currentSpO2 / 98.0, 0.0, 1.0);
+    float norm_bpm = constrain(currentBPM / 140.0, 0.0, 1.0);
+
+    float weightedSum = (norm_hrv * W_HRV) + (norm_spo2 * W_SPO2) + (norm_bpm * W_BPM) + BIAS;
+    float neuralOutput = sigmoid(weightedSum);
+
+    return (int)(neuralOutput * 100);
+}
+
+int calculateBPM(long irSample, long redSample) {
+    if (irSample < 50000) {
+        lastBPM = 0;
+        dcEstimateIR = 0.0;
+        dcEstimateRED = 0.0;
+        lastNeuralFatigue = 0;
+        finalSentFatigue = 0;
+        fatigueSum = 0;
+        fatigueCount = 0;
+        sampleIndex = 0;
+        instantACSignalIR = 0;
+        instantACSignalRED = 0;
+        digitalWrite(BLUE_LED_PIN, LOW);
+        return 0;
+    }
+    
+    digitalWrite(BLUE_LED_PIN, HIGH);
+    
+    if (dcEstimateIR == 0.0) dcEstimateIR = irSample;
+    dcEstimateIR = (dcEstimateIR * DC_ALPHA) + (irSample * (1.0 - DC_ALPHA));
+    long acSignalIR = irSample - (long)dcEstimateIR;
+    instantACSignalIR = acSignalIR;
+    
+    if (dcEstimateRED == 0.0) dcEstimateRED = redSample;
+    dcEstimateRED = (dcEstimateRED * DC_ALPHA) + (redSample * (1.0 - DC_ALPHA));
+    long acSignalRED = redSample - (long)dcEstimateRED;
+    instantACSignalRED = acSignalRED;
+
+    bool isAbove = (acSignalIR > AC_PEAK_THRESHOLD);
+
+    if (!wasAbove && isAbove) { 
+        unsigned long now = micros();
+        if (lastPeakTime > 0) {
+            unsigned long dt_us = now - lastPeakTime;
+            uint32_t dt_ms = dt_us / 1000;
+
+            if (dt_ms > MIN_PEAK_INTERVAL_MS) { 
+                if (dt_ms < 2500) {
+                    lastIBI_ms = dt_ms;
+                    
+                    float bpm = 60000.0 / dt_ms;
+                    bpmHistory[bpmIndex++] = bpm;
+                    if (bpmIndex >= BPM_WINDOW) bpmIndex = 0;
+
+                    float sum = 0;
+                    uint8_t c = 0;
+                    for (int i = 0; i < BPM_WINDOW; i++) {
+                        if (bpmHistory[i] > 0) { sum += bpmHistory[i]; c++; }
+                    }
+                    if (c > 0) lastBPM = round(sum / c);
+                    else lastBPM = round(bpm);
+                }
+                lastPeakTime = now; 
+            }
+        } else {
+            lastPeakTime = now;
+        }
+    }
+
+    wasAbove = isAbove;
+    return lastBPM;
+}
+
+// -----------------------
+// SETUP
+// -----------------------
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+
+    pinMode(BLUE_LED_PIN, OUTPUT);
+    digitalWrite(BLUE_LED_PIN, LOW);
+
+    Wire.begin();
+    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.println("MAX30102 not detected!");
+        while (1);
+    }
+
+    // Initialize with safe default brightness
+    particleSensor.setup((byte)currentBrightness, 4, 2, 200, 411, 4096); 
+    particleSensor.enableDIETEMPRDY(); // Enable temp reading
+
+    Serial.print("Connecting to WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected.");
+    
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    Serial.println("Time synchronized.");
+}
+
+// Helper to sort and find median
+float getMedian(float *array, int size) {
+    // Simple Bubble Sort
+    for (int i = 0; i < size - 1; i++) {
+        for (int j = 0; j < size - i - 1; j++) {
+            if (array[j] > array[j + 1]) {
+                float temp = array[j];
+                array[j] = array[j + 1];
+                array[j + 1] = temp;
+            }
+        }
+    }
+    return array[size / 2]; // Return middle element
+}
+
+// Overload for integer array (BPM)
+int getMedianInt(int *array, int size) {
+    for (int i = 0; i < size - 1; i++) {
+        for (int j = 0; j < size - i - 1; j++) {
+            if (array[j] > array[j + 1]) {
+                int temp = array[j];
+                array[j] = array[j + 1];
+                array[j + 1] = temp;
+            }
+        }
+    }
+    return array[size / 2];
+}
+// -----------------------
+// LOOP
+// -----------------------
+void loop() {
+    // 1. Run Intelligence (Check Temp & Adjust Light)
+    adjustBrightnessPerceptron();
+
+    long irValue  = particleSensor.getIR();
+    long redValue = particleSensor.getRed();
+
+    // --- SATURATION SAFETY CHECK ---
+    if (irValue > 260000 || redValue > 260000) {
+         Serial.println("SENSOR SATURATED - ADJUST FINGER OR RESTART");
+         irValue = 0; 
+         redValue = 0;
+    }
+
+    int BPM = calculateBPM(irValue, redValue);
+    float spo2 = calculateDynamicSpO2(redValue, irValue);
+
+    if (BPM > 40 && spo2 > 50 && sampleIndex < MAX_SAMPLES) {
+        
+        // SLEW RATE CHECK: Ignore massive jumps (noise)
+        // Only accept if it's the first sample OR within 20 BPM of the average
+        bool isValid = true;
+        if (sampleIndex > 0) {
+            int lastValidBPM = bpmBuffer[sampleIndex - 1];
+            if (abs(BPM - lastValidBPM) > 30) isValid = false; // Jump > 30 is noise
+        }
+
+        if (isValid) {
+            bpmBuffer[sampleIndex] = BPM;
+            spo2Buffer[sampleIndex] = spo2;
+            sampleIndex++;
+        }
+    }
+    
+    lastNeuralFatigue = calculateNeuralFatigue(lastIBI_ms, spo2, BPM);
+    
+    if (BPM > 0) {
+        fatigueSum += lastNeuralFatigue;
+        fatigueCount++;
+    }
+
+    String hypoxiaStatus = getHypoxiaStatus(spo2);
+
+    // --- Firebase Transmission ---
+    if (millis() - tsLastFirebaseUpdate >= dataSendInterval) {
+        
+        // Only send if we have enough samples (e.g., at least 5)
+        if (WiFi.status() == WL_CONNECTED && sampleIndex > 5) {
+            
+            // --- CALCULATE MEDIANS ---
+            int medianBPM = getMedianInt(bpmBuffer, sampleIndex);
+            float medianSpO2 = getMedian(spo2Buffer, sampleIndex);
+            
+            // --- Fatigue Logic (Keep existing) ---
+            int avgFatigue = 0;
+            if (fatigueCount > 0) {
+                avgFatigue = fatigueSum / fatigueCount;
+                finalSentFatigue = (int)(avgFatigue / 4.5);
+                if (finalSentFatigue > 30) finalSentFatigue = 30;
+                fatigueSum = 0;
+                fatigueCount = 0;
+            }
+
+            unsigned long currentTimestampMillis = millis();
+            String currentTimeStr = getLocalTimeStr();
+            String medianHypoxia = getHypoxiaStatus(medianSpO2); // Recalculate based on median
+            
+            String jsonPayload = "{";
+            jsonPayload += "\"timestamp_ms\":" + String(currentTimestampMillis) + ",";
+            jsonPayload += "\"time\":" + String("\"" + currentTimeStr + "\"") + ",";
+            jsonPayload += "\"BPM\":" + String(medianBPM) + ",";     // Send Median
+            jsonPayload += "\"SpO2\":" + String(medianSpO2, 1) + ","; // Send Median
+            jsonPayload += "\"Hypoxia_Status\":" + String("\"" + medianHypoxia + "\"") + ",";
+            jsonPayload += "\"Fatigue_Percent\":" + String(finalSentFatigue) + ",";
+            jsonPayload += "\"IR_Raw\":" + String(irValue);
+            jsonPayload += "}";
+
+            // Send
+            String url = "https://" + String(FIREBASE_HOST) + FIREBASE_PATH + ".json";
+            HTTPClient http;
+            http.begin(url);
+            http.addHeader("Content-Type", "application/json");
+            int httpResponseCode = http.PUT(jsonPayload); // Use PUT or POST as desired
+            http.end();
+
+            // RESET BUFFER for next batch
+            sampleIndex = 0;
+        }
+        tsLastFirebaseUpdate = millis();
+    }
+
+    if (millis() - tsLastReport >= 100) {
+        Serial.print("IR_Raw:");
+        Serial.print(irValue);
+        Serial.print(",RED_Raw:");
+        Serial.print(redValue);
+        Serial.print(",IR_AC:");
+        Serial.print(instantACSignalIR);
+        Serial.print(",RED_AC:");
+        Serial.print(instantACSignalRED);
+        Serial.print(",BPM:");
+        Serial.print(BPM);
+        Serial.print(",SpO2:");
+        Serial.print(spo2, 1);
+        Serial.print(",Fatigue_Sent:");
+        Serial.print(finalSentFatigue);
+        Serial.print(",Hypoxia:");
+        Serial.print(hypoxiaStatus);
+        Serial.println();
+
+        tsLastReport = millis();
+    }
+}
