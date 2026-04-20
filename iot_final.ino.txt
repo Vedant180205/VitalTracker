@@ -16,9 +16,9 @@
 
 // -----------------------
 // WIFI & FIREBASE CONFIG
-// -----------------------
-#define WIFI_SSID "PScope"
-#define WIFI_PASSWORD "PScope@604"
+// ----------------------
+#define WIFI_SSID "put_your_wifi_ssid_here"
+#define WIFI_PASSWORD "put_your_wifi_password_here"
 #define FIREBASE_HOST "new-project-ad7f0-default-rtdb.firebaseio.com"
 const String FIREBASE_PATH = "/vitals/current_reading";
 
@@ -304,7 +304,7 @@ void setup() {
     pinMode(BLUE_LED_PIN, OUTPUT);
     digitalWrite(BLUE_LED_PIN, LOW);
 
-    Wire.begin();
+    Wire.begin(17, 18);
     if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
         Serial.println("MAX30102 not detected!");
         while (1);
