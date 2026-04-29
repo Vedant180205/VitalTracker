@@ -349,7 +349,7 @@ void updateOLED() {
 
         case STATE_READING:{
             display.setTextSize(2);
-            display.setCursor(4, 10);
+            display.setCursor(22, 10);
             display.print("Reading");
             
             if ((millis() / 500) % 2 == 0) display.fillCircle(64, 38, 4, SSD1306_WHITE);
